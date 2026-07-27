@@ -1,0 +1,20 @@
+# Local WebRTC checkouts and generated build output.
+/source/
+/out/
+/logs/
+
+# Temporary package staging.
+/_aar_stage/
+/.ghcr-package-tmp/
+
+# Editor and OS noise.
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# Python cache.
+__pycache__/
+*.pyc

@@ -1,0 +1,1424 @@
+name: build-libwebrtc
+
+permissions:
+  actions: read
+  contents: write
+  packages: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Build target
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - linux
+          - android
+          - apple
+          - verify
+      upload_artifacts:
+        description: Upload out artifacts
+        required: true
+        default: true
+        type: boolean
+      use_source_seed:
+        description: Restore WebRTC source seed from GitHub Release
+        required: true
+        default: false
+        type: boolean
+      source_seed_release_tag:
+        description: GitHub Release tag for source seed assets
+        required: true
+        default: webrtc-source-seed
+        type: string
+      upload_release:
+        description: Upload self-contained per-ABI packages to GitHub Release
+        required: true
+        default: true
+        type: boolean
+      release_tag:
+        description: GitHub Release tag; empty uses the pushed tag or build-<YYYYMMDD>
+        required: false
+        default: ''
+        type: string
+  push:
+    branches:
+      - main
+    tags:
+      - 'build-*'
+
+env:
+  WEBRTC_BRANCH_HEAD_M109: '5414'
+  WEBRTC_BRANCH_HEAD_M144: '7559'
+  WEBRTC_BUILD_MAX_ATTEMPTS: '1'
+  WEBRTC_PROXY: none
+  WEBRTC_GHCR_REGISTRY: ghcr.io
+  WEBRTC_GHCR_OWNER: ${{ github.repository_owner }}
+  WEBRTC_SOURCE_PACKAGE: libwebrtc-source
+  WEBRTC_BUILD_PACKAGE: libwebrtc-build
+
+jobs:
+  prepare-windows-sources:
+    name: prepare windows source ${{ matrix.version }}
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'windows'
+    runs-on: windows-2022
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: m109
+            branch_head: '5414'
+            target_os: win7
+            target_cpu: x64
+          - version: m144
+            branch_head: '7559'
+            target_os: win10
+            target_cpu: x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git for Windows source trees
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+          git config --global core.filemode false
+          git config --global core.fscache true
+          git config --global core.preloadindex true
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          choco install zstandard -y --no-progress
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Restore Windows source package
+        id: ghcr-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:windows-${{ matrix.version }}-${{ matrix.branch_head }}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" "source/base/windows-${{ matrix.version }}"
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            src="source/base/windows-${{ matrix.version }}/src"
+            if bash script/common/check_source_clean.sh "$src" "restored windows-${{ matrix.version }} source"; then
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "WARNING: Restored Windows source package is dirty; rebuilding source package." >&2
+              rm -rf "source/base/windows-${{ matrix.version }}"
+              echo "hit=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Install source seed tools
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        shell: pwsh
+        run: choco install zstandard -y --no-progress
+
+      - name: Restore Windows source seed
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBRTC_SOURCE_SEED_RELEASE_TAG: ${{ inputs.source_seed_release_tag || 'webrtc-source-seed' }}
+        run: |
+          bash script/common/restore_source_seed.sh "${{ matrix.version }}" "${{ matrix.branch_head }}" || echo "WARNING: ${{ matrix.version }} source seed restore failed; falling back to normal fetch/sync."
+
+      - name: Create Windows base source from seed
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: pwsh
+        run: |
+          $seed = 'source\seed\${{ matrix.version }}'
+          $destination = 'source\base\windows-${{ matrix.version }}'
+          if (Test-Path (Join-Path $seed 'src\.git')) {
+            powershell -NoProfile -ExecutionPolicy Bypass -File script\common\ensure_source_tree.ps1 -Source $seed -Destination $destination
+          }
+
+      - name: Sync Windows source
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: cmd
+        run: |
+          set "WEBRTC_SOURCE_ROOT=%GITHUB_WORKSPACE%\source\base\windows-${{ matrix.version }}"
+          set "WEBRTC_TARGET_OS=${{ matrix.target_os }}"
+          set "WEBRTC_TARGET_CPU=${{ matrix.target_cpu }}"
+          set "WEBRTC_PACKAGE_VERSION=${{ matrix.version }}"
+          set "WEBRTC_BRANCH_HEAD=${{ matrix.branch_head }}"
+          set "WEBRTC_MSVC_RUNTIME=MD"
+          set "WEBRTC_BUILD_CONFIG=Release"
+          set "WEBRTC_SYNC_ONLY=1"
+          set "WEBRTC_SKIP_GCLIENT_SYNC=0"
+          call script\common\check_env.bat
+          if errorlevel 1 exit /b 1
+          call script\${{ matrix.target_os }}\${{ matrix.target_cpu }}\${{ matrix.version }}\build.bat
+
+      - name: Push Windows source package
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          src="source/base/windows-${{ matrix.version }}/src"
+          echo "== Windows source state before GHCR push =="
+          git -C "$src" rev-parse --short HEAD
+          git -C "$src" config --get core.autocrlf || true
+          git -C "$src" config --get core.eol || true
+          echo "changed-count=$(git -C "$src" status --porcelain=v1 | wc -l)"
+          git -C "$src" status --porcelain=v1 | sed -n '1,200p'
+          git -C "$src" diff --numstat | sed -n '1,80p'
+          echo "desktop_capture_options worktree sha256:"
+          sha256sum "$src/modules/desktop_capture/desktop_capture_options.cc"
+          echo "desktop_capture_options git blob sha256:"
+          git -C "$src" show HEAD:modules/desktop_capture/desktop_capture_options.cc | sha256sum
+          bash script/common/check_source_clean.sh "$src" "windows-${{ matrix.version }} source before GHCR push"
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:windows-${{ matrix.version }}-${{ matrix.branch_head }}"
+          bash script/common/ghcr_package.sh push "$ref" "source/base/windows-${{ matrix.version }}" "windows-${{ matrix.version }}-${{ matrix.branch_head }}.7z" "application/vnd.libwebrtc.source.layer.v2+7z"
+
+  prepare-linux-source:
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'linux'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Ensure shell scripts are executable
+        shell: bash
+        run: git ls-files '*.sh' | xargs chmod +x
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd rsync unzip
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Restore Linux source package
+        id: ghcr-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:linux-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" source/base/linux-m144
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Restore CentOS7 sysroot package
+        id: ghcr-centos7
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:centos7-sysroot-v1"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" source/centos7-sysroot
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Install source seed tools
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd rsync
+
+      - name: Restore Linux source seed
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBRTC_SOURCE_SEED_RELEASE_TAG: ${{ inputs.source_seed_release_tag || 'webrtc-source-seed' }}
+        run: |
+          bash script/common/restore_source_seed.sh m144 "${WEBRTC_BRANCH_HEAD_M144}" || echo "WARNING: m144 source seed restore failed; falling back to normal fetch/sync."
+          if [[ -d source/seed/m144/src/.git ]]; then
+            bash script/common/copy_source_seed.sh source/seed/m144 source/base/linux-m144
+          fi
+
+      - name: Build cached Docker builder image
+        if: steps.ghcr-source.outputs.hit != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: script/linux/all/m144
+          file: script/linux/all/m144/Dockerfile
+          tags: libwebrtc-linux-m144-builder:ubuntu22.04
+          load: true
+          cache-from: type=gha,scope=libwebrtc-linux-m144-builder
+          cache-to: type=gha,scope=libwebrtc-linux-m144-builder,mode=max
+
+      - name: Sync Linux source
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          if [[ "${{ steps.ghcr-centos7.outputs.hit }}" != "true" ]]; then
+            bash script/linux/_shared/prepare_centos7_sysroot.sh source/centos7-sysroot
+          fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$GITHUB_WORKSPACE/source/base/linux-m144:/webrtc" \
+            -w /work \
+            -e WEBRTC_ROOT=/webrtc \
+            -e WEBRTC_PACKAGE_VERSION=m144 \
+            -e WEBRTC_BRANCH_HEAD="${WEBRTC_BRANCH_HEAD_M144}" \
+            -e WEBRTC_TARGET_CPU=x64 \
+            -e WEBRTC_LINUX_STL=gnu \
+            -e WEBRTC_BUILD_CONFIG=Release \
+            -e WEBRTC_SYNC_ONLY=1 \
+            -e WEBRTC_SKIP_GCLIENT_SYNC=0 \
+            libwebrtc-linux-m144-builder:ubuntu22.04 \
+            bash -lc 'find /work/script -name "*.sh" -exec chmod +x {} + && /work/script/linux/x64/m144/build.sh'
+
+      - name: Fix Linux source ownership
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" source/base/linux-m144
+          chmod -R u+rwX source/base/linux-m144
+
+      - name: Push Linux source package
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:linux-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          bash script/common/ghcr_package.sh push "$ref" source/base/linux-m144 "linux-m144-${WEBRTC_BRANCH_HEAD_M144}.tar.zst" "application/vnd.libwebrtc.source.layer.v1+zstd"
+
+      - name: Push CentOS7 sysroot package
+        if: steps.ghcr-centos7.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:centos7-sysroot-v1"
+          bash script/common/ghcr_package.sh push "$ref" source/centos7-sysroot "centos7-sysroot-v1.tar.zst" "application/vnd.libwebrtc.source.layer.v1+zstd"
+
+  prepare-android-source:
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'android'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Ensure shell scripts are executable
+        shell: bash
+        run: git ls-files '*.sh' | xargs chmod +x
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd rsync unzip
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Restore Android source package
+        id: ghcr-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:android-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" source/base/android-m144
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Install source seed tools
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd rsync
+
+      - name: Restore Android source seed
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBRTC_SOURCE_SEED_RELEASE_TAG: ${{ inputs.source_seed_release_tag || 'webrtc-source-seed' }}
+        run: |
+          bash script/common/restore_source_seed.sh m144 "${WEBRTC_BRANCH_HEAD_M144}" || echo "WARNING: m144 source seed restore failed; falling back to normal fetch/sync."
+          if [[ -d source/seed/m144/src/.git ]]; then
+            bash script/common/copy_source_seed.sh source/seed/m144 source/base/android-m144
+          fi
+
+      - name: Build cached Docker builder image
+        if: steps.ghcr-source.outputs.hit != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: script/linux/all/m144
+          file: script/linux/all/m144/Dockerfile
+          tags: libwebrtc-linux-m144-builder:ubuntu22.04
+          load: true
+          cache-from: type=gha,scope=libwebrtc-linux-m144-builder
+          cache-to: type=gha,scope=libwebrtc-linux-m144-builder,mode=max
+
+      - name: Sync Android source
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$GITHUB_WORKSPACE/source/base/android-m144:/webrtc" \
+            -w /work \
+            -e WEBRTC_ROOT=/webrtc \
+            -e WEBRTC_PACKAGE_VERSION=m144 \
+            -e WEBRTC_BRANCH_HEAD="${WEBRTC_BRANCH_HEAD_M144}" \
+            -e WEBRTC_TARGET_ABI=arm64-v8a \
+            -e WEBRTC_BUILD_CONFIG=Release \
+            -e WEBRTC_ANDROID_MIN_SDK=22 \
+            -e WEBRTC_SYNC_ONLY=1 \
+            -e WEBRTC_SKIP_GCLIENT_SYNC=0 \
+            libwebrtc-linux-m144-builder:ubuntu22.04 \
+            bash -lc 'find /work/script -name "*.sh" -exec chmod +x {} + && /work/script/android/arm64-v8a/m144/build.sh'
+
+      - name: Fix Android source ownership
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" source/base/android-m144
+          chmod -R u+rwX source/base/android-m144
+
+      - name: Push Android source package
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:android-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          bash script/common/ghcr_package.sh push "$ref" source/base/android-m144 "android-m144-${WEBRTC_BRANCH_HEAD_M144}.tar.zst" "application/vnd.libwebrtc.source.layer.v1+zstd"
+
+  prepare-apple-source:
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'apple'
+    runs-on: macos-15-intel
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure shell scripts are executable
+        shell: bash
+        run: git ls-files '*.sh' | xargs chmod +x
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          brew install zstd || true
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Restore Apple source package
+        id: ghcr-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:apple-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" source/base/apple-m144
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Install source seed tools
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        run: brew install zstd || true
+
+      - name: Restore Apple source seed
+        if: steps.ghcr-source.outputs.hit != 'true' && github.event_name == 'workflow_dispatch' && inputs.use_source_seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBRTC_SOURCE_SEED_RELEASE_TAG: ${{ inputs.source_seed_release_tag || 'webrtc-source-seed' }}
+        run: |
+          bash script/common/restore_source_seed.sh m144 "${WEBRTC_BRANCH_HEAD_M144}" || echo "WARNING: m144 source seed restore failed; falling back to normal fetch/sync."
+          if [[ -d source/seed/m144/src/.git ]]; then
+            bash script/common/copy_source_seed.sh source/seed/m144 source/base/apple-m144
+          fi
+
+      - name: Sync Apple source
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          export WEBRTC_SOURCE_ROOT="$GITHUB_WORKSPACE/source/base/apple-m144"
+          export WEBRTC_TARGET_OS=macos
+          export WEBRTC_TARGET_CPU=x64
+          export WEBRTC_BUILD_CONFIG=Release
+          export WEBRTC_BRANCH_HEAD="${WEBRTC_BRANCH_HEAD_M144}"
+          export WEBRTC_SYNC_ONLY=1
+          export WEBRTC_SKIP_GCLIENT_SYNC=0
+          export WEBRTC_GCLIENT_JOBS="$(sysctl -n hw.logicalcpu)"
+          bash script/apple/_shared/build_apple.sh
+
+      - name: Push Apple source package
+        if: steps.ghcr-source.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:apple-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          bash script/common/ghcr_package.sh push "$ref" source/base/apple-m144 "apple-m144-${WEBRTC_BRANCH_HEAD_M144}.tar.zst" "application/vnd.libwebrtc.source.layer.v1+zstd"
+
+  prepare-sources:
+    name: prepare source packages
+    if: always() && (github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'windows' || inputs.target == 'linux' || inputs.target == 'android' || inputs.target == 'apple')
+    needs:
+      - prepare-windows-sources
+      - prepare-linux-source
+      - prepare-android-source
+      - prepare-apple-source
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require selected source packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ github.event_name == 'push' && 'all' || inputs.target }}"
+
+          check_result() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "Required source prepare job failed or did not complete: $name result=$result" >&2
+              exit 1
+            fi
+          }
+
+          case "$target" in
+            all)
+              check_result prepare-windows-sources "${{ needs.prepare-windows-sources.result }}"
+              check_result prepare-linux-source "${{ needs.prepare-linux-source.result }}"
+              check_result prepare-android-source "${{ needs.prepare-android-source.result }}"
+              check_result prepare-apple-source "${{ needs.prepare-apple-source.result }}"
+              ;;
+            windows)
+              check_result prepare-windows-sources "${{ needs.prepare-windows-sources.result }}"
+              ;;
+            linux)
+              check_result prepare-linux-source "${{ needs.prepare-linux-source.result }}"
+              ;;
+            android)
+              check_result prepare-android-source "${{ needs.prepare-android-source.result }}"
+              ;;
+            apple)
+              check_result prepare-apple-source "${{ needs.prepare-apple-source.result }}"
+              ;;
+          esac
+
+  windows:
+    name: windows ${{ matrix.os }} ${{ matrix.cpu }} ${{ matrix.version }} ${{ matrix.runtime }} ${{ matrix.config }}
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'windows'
+    needs: prepare-sources
+    runs-on: windows-2022
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: win7
+            cpu: x86
+            version: m109
+            branch_head: '5414'
+            runtime: MD
+            config: Release
+            cache_suffix: win7-x86-m109-md-release
+          - os: win7
+            cpu: x64
+            version: m109
+            branch_head: '5414'
+            runtime: MD
+            config: Release
+            cache_suffix: win7-x64-m109-md-release
+          - os: win7
+            cpu: x86
+            version: m109
+            branch_head: '5414'
+            runtime: MT
+            config: Release
+            cache_suffix: win7-x86-m109-mt-release
+          - os: win7
+            cpu: x64
+            version: m109
+            branch_head: '5414'
+            runtime: MT
+            config: Release
+            cache_suffix: win7-x64-m109-mt-release
+          - os: win7
+            cpu: x86
+            version: m109
+            branch_head: '5414'
+            runtime: MD
+            config: Debug
+            cache_suffix: win7-x86-m109-md-debug
+          - os: win7
+            cpu: x64
+            version: m109
+            branch_head: '5414'
+            runtime: MD
+            config: Debug
+            cache_suffix: win7-x64-m109-md-debug
+          - os: win7
+            cpu: x86
+            version: m109
+            branch_head: '5414'
+            runtime: MT
+            config: Debug
+            cache_suffix: win7-x86-m109-mt-debug
+          - os: win7
+            cpu: x64
+            version: m109
+            branch_head: '5414'
+            runtime: MT
+            config: Debug
+            cache_suffix: win7-x64-m109-mt-debug
+          - os: win10
+            cpu: x64
+            version: m144
+            branch_head: '7559'
+            runtime: MD
+            config: Release
+            cache_suffix: win10-x64-m144-md-release
+          - os: win10
+            cpu: arm64
+            version: m144
+            branch_head: '7559'
+            runtime: MD
+            config: Release
+            cache_suffix: win10-arm64-m144-md-release
+          - os: win10
+            cpu: x64
+            version: m144
+            branch_head: '7559'
+            runtime: MT
+            config: Release
+            cache_suffix: win10-x64-m144-mt-release
+          - os: win10
+            cpu: arm64
+            version: m144
+            branch_head: '7559'
+            runtime: MT
+            config: Release
+            cache_suffix: win10-arm64-m144-mt-release
+          - os: win10
+            cpu: x64
+            version: m144
+            branch_head: '7559'
+            runtime: MD
+            config: Debug
+            cache_suffix: win10-x64-m144-md-debug
+          - os: win10
+            cpu: arm64
+            version: m144
+            branch_head: '7559'
+            runtime: MD
+            config: Debug
+            cache_suffix: win10-arm64-m144-md-debug
+          - os: win10
+            cpu: x64
+            version: m144
+            branch_head: '7559'
+            runtime: MT
+            config: Debug
+            cache_suffix: win10-x64-m144-mt-debug
+          - os: win10
+            cpu: arm64
+            version: m144
+            branch_head: '7559'
+            runtime: MT
+            config: Debug
+            cache_suffix: win10-arm64-m144-mt-debug
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git for Windows source trees
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+          git config --global core.filemode false
+          git config --global core.fscache true
+          git config --global core.preloadindex true
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          choco install zstandard -y --no-progress
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Compute build definition hash
+        id: build-def
+        shell: pwsh
+        run: |
+          $files = @('.github/workflows/build-libwebrtc.yml') + (git ls-files 'script')
+          $joined = ($files | Sort-Object | ForEach-Object {
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash
+          }) -join "`n"
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($joined)
+          $hash = (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 16)
+          "hash=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Restore Windows build package
+        id: ghcr-build
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:windows-${{ matrix.cache_suffix }}-${{ matrix.branch_head }}-${{ steps.build-def.outputs.hash }}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" out
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Restore Windows base source
+        if: steps.ghcr-build.outputs.hit != 'true'
+        id: restore-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:windows-${{ matrix.version }}-${{ matrix.branch_head }}"
+          bash script/common/ghcr_package.sh pull "$ref" "source/base/windows-${{ matrix.version }}"
+          bash script/common/check_source_clean.sh "source/base/windows-${{ matrix.version }}/src" "restored windows-${{ matrix.version }} source"
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create Windows source tree
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: pwsh
+        run: |
+          $base = 'source\base\windows-${{ matrix.version }}'
+          $destination = 'source\w\${{ matrix.cache_suffix }}'
+          powershell -NoProfile -ExecutionPolicy Bypass -File script\common\ensure_source_tree.ps1 -Source $base -Destination $destination
+
+      - name: Diagnose Windows restored source
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          for root in "source/base/windows-${{ matrix.version }}/src" "source/w/${{ matrix.cache_suffix }}/src"; do
+            echo "== Windows source state: $root =="
+            git -C "$root" rev-parse --short HEAD
+            git -C "$root" config --get core.autocrlf || true
+            git -C "$root" config --get core.eol || true
+            echo "changed-count=$(git -C "$root" status --porcelain=v1 | wc -l)"
+            git -C "$root" status --porcelain=v1 | sed -n '1,200p'
+            git -C "$root" diff --numstat | sed -n '1,80p'
+            echo "desktop_capture_options worktree sha256:"
+            sha256sum "$root/modules/desktop_capture/desktop_capture_options.cc"
+            echo "desktop_capture_options git blob sha256:"
+            git -C "$root" show HEAD:modules/desktop_capture/desktop_capture_options.cc | sha256sum
+          done
+
+      - name: Build Windows packages
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: cmd
+        run: |
+          set "WEBRTC_SOURCE_ROOT=%GITHUB_WORKSPACE%\source\w\${{ matrix.cache_suffix }}"
+          set "WEBRTC_TARGET_OS=${{ matrix.os }}"
+          set "WEBRTC_TARGET_CPU=${{ matrix.cpu }}"
+          set "WEBRTC_PACKAGE_VERSION=${{ matrix.version }}"
+          set "WEBRTC_BRANCH_HEAD=${{ matrix.branch_head }}"
+          set "WEBRTC_MSVC_RUNTIME=${{ matrix.runtime }}"
+          set "WEBRTC_BUILD_CONFIG=${{ matrix.config }}"
+          set "WEBRTC_SKIP_GCLIENT_SYNC=1"
+          call script\common\check_env.bat
+          if errorlevel 1 exit /b 1
+          call script\%WEBRTC_TARGET_OS%\%WEBRTC_TARGET_CPU%\%WEBRTC_PACKAGE_VERSION%\build.bat
+          if errorlevel 1 exit /b 1
+          call script\%WEBRTC_TARGET_OS%\%WEBRTC_TARGET_CPU%\%WEBRTC_PACKAGE_VERSION%\package.bat
+
+      - name: Push Windows build package
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:windows-${{ matrix.cache_suffix }}-${{ matrix.branch_head }}-${{ steps.build-def.outputs.hash }}"
+          bash script/common/ghcr_package.sh push "$ref" out "windows-${{ matrix.cache_suffix }}-${{ matrix.branch_head }}.tar.zst" "application/vnd.libwebrtc.build.layer.v1+zstd"
+
+      - name: Verify Windows package slice
+        shell: pwsh
+        run: >
+          python script/common/verify_package_slice.py
+          --root out
+          --os "${{ matrix.os }}"
+          --cpu "${{ matrix.cpu }}"
+          --version "${{ matrix.version }}"
+          --config "${{ matrix.config }}"
+          --runtime "${{ matrix.runtime }}"
+
+      - name: Upload Windows artifacts
+        if: github.event_name == 'push' || inputs.upload_artifacts || (inputs.target == 'all' && inputs.upload_release)
+        uses: actions/upload-artifact@v7
+        with:
+          name: libwebrtc-windows-${{ matrix.cache_suffix }}
+          path: out
+          if-no-files-found: error
+
+  linux:
+    name: linux ${{ matrix.compat }} ${{ matrix.arch }} ${{ matrix.stl }} ${{ matrix.config }}
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'linux'
+    needs: prepare-sources
+    runs-on: ubuntu-22.04
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compat: ubuntu18
+            arch: x64
+            stl: gnu
+            config: Release
+            cache_suffix: ubuntu18-x64-gnu-release
+          - compat: ubuntu18
+            arch: armhf
+            stl: gnu
+            config: Release
+            cache_suffix: ubuntu18-armhf-gnu-release
+          - compat: ubuntu18
+            arch: arm64
+            stl: gnu
+            config: Release
+            cache_suffix: ubuntu18-arm64-gnu-release
+          - compat: ubuntu18
+            arch: x64
+            stl: libcxx
+            config: Release
+            cache_suffix: ubuntu18-x64-libcxx-release
+          - compat: ubuntu18
+            arch: armhf
+            stl: libcxx
+            config: Release
+            cache_suffix: ubuntu18-armhf-libcxx-release
+          - compat: ubuntu18
+            arch: arm64
+            stl: libcxx
+            config: Release
+            cache_suffix: ubuntu18-arm64-libcxx-release
+          - compat: ubuntu18
+            arch: x64
+            stl: gnu
+            config: Debug
+            cache_suffix: ubuntu18-x64-gnu-debug
+          - compat: ubuntu18
+            arch: armhf
+            stl: gnu
+            config: Debug
+            cache_suffix: ubuntu18-armhf-gnu-debug
+          - compat: ubuntu18
+            arch: arm64
+            stl: gnu
+            config: Debug
+            cache_suffix: ubuntu18-arm64-gnu-debug
+          - compat: ubuntu18
+            arch: x64
+            stl: libcxx
+            config: Debug
+            cache_suffix: ubuntu18-x64-libcxx-debug
+          - compat: ubuntu18
+            arch: armhf
+            stl: libcxx
+            config: Debug
+            cache_suffix: ubuntu18-armhf-libcxx-debug
+          - compat: ubuntu18
+            arch: arm64
+            stl: libcxx
+            config: Debug
+            cache_suffix: ubuntu18-arm64-libcxx-debug
+          - compat: centos7
+            arch: x64
+            stl: libcxx
+            config: Release
+            cache_suffix: centos7-x64-libcxx-release
+          - compat: centos7
+            arch: x64
+            stl: libcxx
+            config: Debug
+            cache_suffix: centos7-x64-libcxx-debug
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Ensure shell scripts are executable
+        shell: bash
+        run: git ls-files '*.sh' | xargs chmod +x
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd rsync unzip
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Compute build definition hash
+        id: build-def
+        shell: bash
+        run: |
+          hash="$({ printf '%s\n' .github/workflows/build-libwebrtc.yml; git ls-files script; } | sort | xargs sha256sum | sha256sum | cut -c1-16)"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Linux build package
+        id: ghcr-build
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:linux-${{ matrix.cache_suffix }}-${WEBRTC_BRANCH_HEAD_M144}-${{ steps.build-def.outputs.hash }}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" out
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Restore Linux base source
+        if: steps.ghcr-build.outputs.hit != 'true'
+        id: restore-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:linux-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          bash script/common/ghcr_package.sh pull "$ref" source/base/linux-m144
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+
+      - name: Restore CentOS7 sysroot package
+        if: steps.ghcr-build.outputs.hit != 'true'
+        id: ghcr-centos7
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:centos7-sysroot-v1"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" source/centos7-sysroot
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Create Linux matrix source tree
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          bash script/common/copy_source_seed.sh source/base/linux-m144 "source/linux-m144-${{ matrix.cache_suffix }}"
+
+      - name: Build cached Docker builder image
+        if: steps.ghcr-build.outputs.hit != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: script/linux/all/m144
+          file: script/linux/all/m144/Dockerfile
+          tags: libwebrtc-linux-m144-builder:ubuntu22.04
+          load: true
+          cache-from: type=gha,scope=libwebrtc-linux-m144-builder
+          cache-to: type=gha,scope=libwebrtc-linux-m144-builder,mode=max
+
+      - name: Build Linux packages
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          export WEBRTC_DOCKER_CPUS="$(nproc)"
+          export WEBRTC_LINUX_ROOT="$GITHUB_WORKSPACE/source/linux-m144-${{ matrix.cache_suffix }}"
+          export WEBRTC_TARGET_CPU_LIST="${{ matrix.arch }}"
+          export WEBRTC_LINUX_STL_LIST="${{ matrix.stl }}"
+          export WEBRTC_BUILD_CONFIG_LIST="${{ matrix.config }}"
+          export WEBRTC_LINUX_COMPAT="${{ matrix.compat }}"
+          export WEBRTC_BUILD_CENTOS7=0
+          export WEBRTC_SKIP_GCLIENT_SYNC=1
+          bash script/build_linux_m144_docker.sh
+
+      - name: Push Linux build package
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:linux-${{ matrix.cache_suffix }}-${WEBRTC_BRANCH_HEAD_M144}-${{ steps.build-def.outputs.hash }}"
+          bash script/common/ghcr_package.sh push "$ref" out "linux-${{ matrix.cache_suffix }}-${WEBRTC_BRANCH_HEAD_M144}.tar.zst" "application/vnd.libwebrtc.build.layer.v1+zstd"
+
+      - name: Verify Linux package slice
+        shell: bash
+        run: |
+          package_os=linux
+          if [[ "${{ matrix.compat }}" == "centos7" ]]; then
+            package_os=linux-centos7
+          fi
+          python3 script/common/verify_package_slice.py \
+            --root out \
+            --os "$package_os" \
+            --cpu "${{ matrix.arch }}" \
+            --version m144 \
+            --config "${{ matrix.config }}" \
+            --stl "${{ matrix.stl }}"
+
+      - name: Upload Linux artifacts
+        if: github.event_name == 'push' || inputs.upload_artifacts || (inputs.target == 'all' && inputs.upload_release)
+        uses: actions/upload-artifact@v7
+        with:
+          name: libwebrtc-linux-${{ matrix.cache_suffix }}
+          path: out
+          if-no-files-found: error
+
+  android:
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'android'
+    needs: prepare-sources
+    runs-on: ubuntu-22.04
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Ensure shell scripts are executable
+        shell: bash
+        run: git ls-files '*.sh' | xargs chmod +x
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd rsync unzip
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Compute build definition hash
+        id: build-def
+        shell: bash
+        run: |
+          hash="$({ printf '%s\n' .github/workflows/build-libwebrtc.yml; git ls-files script; } | sort | xargs sha256sum | sha256sum | cut -c1-16)"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Android build package
+        id: ghcr-build
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:android-m144-${WEBRTC_BRANCH_HEAD_M144}-${{ steps.build-def.outputs.hash }}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" out
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Restore Android base source
+        if: steps.ghcr-build.outputs.hit != 'true'
+        id: restore-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:android-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          bash script/common/ghcr_package.sh pull "$ref" source/base/android-m144
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create Android source tree
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          bash script/common/copy_source_seed.sh source/base/android-m144 source/android-m144
+
+      - name: Build cached Docker builder image
+        if: steps.ghcr-build.outputs.hit != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: script/linux/all/m144
+          file: script/linux/all/m144/Dockerfile
+          tags: libwebrtc-linux-m144-builder:ubuntu22.04
+          load: true
+          cache-from: type=gha,scope=libwebrtc-linux-m144-builder
+          cache-to: type=gha,scope=libwebrtc-linux-m144-builder,mode=max
+
+      - name: Build Android packages
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          export WEBRTC_SKIP_GCLIENT_SYNC=1
+          export WEBRTC_DOCKER_CPUS="$(nproc)"
+          bash script/build_android_m144_docker.sh
+
+      - name: Push Android build package
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:android-m144-${WEBRTC_BRANCH_HEAD_M144}-${{ steps.build-def.outputs.hash }}"
+          bash script/common/ghcr_package.sh push "$ref" out "android-m144-${WEBRTC_BRANCH_HEAD_M144}.tar.zst" "application/vnd.libwebrtc.build.layer.v1+zstd"
+
+      - name: Verify Android package slices
+        shell: bash
+        run: |
+          for config in Release Debug; do
+            for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+              python3 script/common/verify_package_slice.py \
+                --root out \
+                --os android \
+                --cpu "$abi" \
+                --version m144 \
+                --config "$config"
+            done
+          done
+
+      - name: Upload Android artifacts
+        if: github.event_name == 'push' || inputs.upload_artifacts || (inputs.target == 'all' && inputs.upload_release)
+        uses: actions/upload-artifact@v7
+        with:
+          name: libwebrtc-android
+          path: out
+          if-no-files-found: error
+
+  apple:
+    name: apple ${{ matrix.target_os }} ${{ matrix.cpu }} ${{ matrix.config }}
+    if: github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'apple'
+    needs: prepare-sources
+    runs-on: macos-15-intel
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_os: macos
+            cpu: x64
+            config: Release
+            cache_suffix: macos-x64-release
+          - target_os: macos
+            cpu: arm64
+            config: Release
+            cache_suffix: macos-arm64-release
+          - target_os: macos
+            cpu: x64
+            config: Debug
+            cache_suffix: macos-x64-debug
+          - target_os: macos
+            cpu: arm64
+            config: Debug
+            cache_suffix: macos-arm64-debug
+          - target_os: ios
+            cpu: arm64
+            config: Release
+            cache_suffix: ios-arm64-release
+          - target_os: ios
+            cpu: arm64
+            config: Debug
+            cache_suffix: ios-arm64-debug
+          - target_os: ios_simulator
+            cpu: x64
+            config: Release
+            cache_suffix: ios-simulator-x64-release
+          - target_os: ios_simulator
+            cpu: arm64
+            config: Release
+            cache_suffix: ios-simulator-arm64-release
+          - target_os: ios_simulator
+            cpu: x64
+            config: Debug
+            cache_suffix: ios-simulator-x64-debug
+          - target_os: ios_simulator
+            cpu: arm64
+            config: Debug
+            cache_suffix: ios-simulator-arm64-debug
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure shell scripts are executable
+        shell: bash
+        run: git ls-files '*.sh' | xargs chmod +x
+
+      - name: Install GHCR package tools
+        shell: bash
+        run: |
+          brew install zstd || true
+          bash script/common/install_oras.sh
+          echo "${{ github.token }}" | "$HOME/bin/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Compute build definition hash
+        id: build-def
+        shell: bash
+        run: |
+          hash="$({ printf '%s\n' .github/workflows/build-libwebrtc.yml; git ls-files script; } | sort | xargs shasum -a 256 | shasum -a 256 | cut -c1-16)"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Apple build package
+        id: ghcr-build
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:apple-${{ matrix.cache_suffix }}-${WEBRTC_BRANCH_HEAD_M144}-${{ steps.build-def.outputs.hash }}"
+          set +e
+          bash script/common/ghcr_package.sh pull "$ref" out
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Restore Apple base source
+        if: steps.ghcr-build.outputs.hit != 'true'
+        id: restore-source
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_SOURCE_PACKAGE}:apple-m144-${WEBRTC_BRANCH_HEAD_M144}"
+          bash script/common/ghcr_package.sh pull "$ref" source/base/apple-m144
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create Apple matrix source tree
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          bash script/common/copy_source_seed.sh source/base/apple-m144 "source/apple-m144-${{ matrix.cache_suffix }}"
+
+      - name: Build Apple package
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          export WEBRTC_SOURCE_ROOT="$GITHUB_WORKSPACE/source/apple-m144-${{ matrix.cache_suffix }}"
+          export WEBRTC_TARGET_OS="${{ matrix.target_os }}"
+          export WEBRTC_TARGET_CPU="${{ matrix.cpu }}"
+          export WEBRTC_BUILD_CONFIG="${{ matrix.config }}"
+          export WEBRTC_GCLIENT_JOBS="$(sysctl -n hw.logicalcpu)"
+          export NINJAFLAGS="-j$(sysctl -n hw.logicalcpu)"
+          export WEBRTC_SKIP_GCLIENT_SYNC=1
+          bash script/apple/_shared/build_apple.sh
+          bash script/apple/_shared/package_apple.sh
+
+      - name: Push Apple build package
+        if: steps.ghcr-build.outputs.hit != 'true'
+        shell: bash
+        run: |
+          ref="${WEBRTC_GHCR_REGISTRY}/${WEBRTC_GHCR_OWNER}/${WEBRTC_BUILD_PACKAGE}:apple-${{ matrix.cache_suffix }}-${WEBRTC_BRANCH_HEAD_M144}-${{ steps.build-def.outputs.hash }}"
+          bash script/common/ghcr_package.sh push "$ref" out "apple-${{ matrix.cache_suffix }}-${WEBRTC_BRANCH_HEAD_M144}.tar.zst" "application/vnd.libwebrtc.build.layer.v1+zstd"
+
+      - name: Verify Apple package slice
+        shell: bash
+        run: |
+          package_os="${{ matrix.target_os }}"
+          if [[ "$package_os" == "ios_simulator" ]]; then
+            package_os=ios-simulator
+          fi
+          python3 script/common/verify_package_slice.py \
+            --root out \
+            --os "$package_os" \
+            --cpu "${{ matrix.cpu }}" \
+            --version m144 \
+            --config "${{ matrix.config }}"
+
+      - name: Upload Apple artifacts
+        if: github.event_name == 'push' || inputs.upload_artifacts || (inputs.target == 'all' && inputs.upload_release)
+        uses: actions/upload-artifact@v7
+        with:
+          name: libwebrtc-apple-${{ matrix.cache_suffix }}
+          path: out
+          if-no-files-found: error
+
+  plan-release-packages:
+    if: always() && (github.event_name == 'push' || (inputs.target == 'all' && inputs.upload_release))
+    needs:
+      - windows
+      - linux
+      - android
+      - apple
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.packages.outputs.matrix }}
+    steps:
+      - name: Check all build jobs completed
+        shell: bash
+        run: |
+          set -euo pipefail
+          for result in \
+            "${{ needs.windows.result }}" \
+            "${{ needs.linux.result }}" \
+            "${{ needs.android.result }}" \
+            "${{ needs.apple.result }}"; do
+            if [[ "$result" != "success" ]]; then
+              echo "Required build job result is not success: $result" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@v4
+
+      - name: Plan split release packages
+        id: packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix="$(python3 script/common/release_packages.py matrix)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  package-release:
+    needs: plan-release-packages
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan-release-packages.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+
+      - name: Download package build artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a artifacts <<< "${{ matrix.artifacts }}"
+          bash script/common/download_run_artifacts.sh \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_REPOSITORY" \
+            platform-artifacts \
+            "${artifacts[@]}"
+
+      - name: Stage self-contained release packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf staged dist
+          mkdir -p staged dist
+          python3 script/common/release_packages.py stage \
+            --group "${{ matrix.group }}" \
+            --artifacts-root platform-artifacts \
+            --output-root staged
+
+      - name: Archive self-contained release packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          package_dirs=(staged/libwebrtc-*)
+          if [[ "${#package_dirs[@]}" -eq 0 ]]; then
+            echo "No staged release package directories found." >&2
+            exit 1
+          fi
+          for dir in "${package_dirs[@]}"; do
+            asset="$(basename "$dir").tar.zst"
+            tar -I 'zstd -T0 -10' -cf "dist/$asset" -C "$dir" .
+          done
+          if find dist -maxdepth 1 -type f -name '*full*' | grep -q .; then
+            echo "Full all-platform archives are forbidden." >&2
+            exit 1
+          fi
+
+      - name: Upload split package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-package-${{ matrix.group }}
+          path: dist
+          if-no-files-found: error
+
+  release:
+    needs: package-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download split package artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t artifacts < <(python3 script/common/release_packages.py release-artifacts)
+          bash script/common/download_run_artifacts.sh --merge \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_REPOSITORY" \
+            dist \
+            "${artifacts[@]}"
+
+      - name: Generate split package manifest
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ inputs.release_tag }}" ]]; then
+            release_tag="${{ inputs.release_tag }}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            release_tag="build-$(date +%Y%m%d)"
+          fi
+          python3 script/common/generate_release_manifest.py \
+            --assets dist \
+            --release-tag "$release_tag" \
+            --output dist/libwebrtc-manifest.json
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload split package index
+        uses: actions/upload-artifact@v7
+        with:
+          name: libwebrtc-release-index
+          path: dist/libwebrtc-manifest.json
+          if-no-files-found: error
+
+      - name: Publish split packages to Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.manifest.outputs.release_tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --cleanup-tag --yes
+          fi
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "LibWebRTC $tag" \
+            --notes "Self-contained per-ABI LibWebRTC packages built by GitHub Actions." \
+            --latest
+          while IFS= read -r release_asset; do
+            gh release upload "$tag" "$release_asset" --clobber
+          done < <(find dist -maxdepth 1 -type f -print | LC_ALL=C sort)
+
+  verify:
+    if: inputs.target == 'verify'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify checked-in scripts
+        shell: pwsh
+        run: |
+          Get-ChildItem script -Recurse -Filter *.ps1 | ForEach-Object {
+            $null = [System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw $_.FullName), [ref]$null)
+          }

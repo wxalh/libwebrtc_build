@@ -1,0 +1,90 @@
+name: publish-source-seed
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: WebRTC seed version
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - m109
+          - m144
+      release_tag:
+        description: GitHub Release tag for seed assets
+        required: true
+        default: webrtc-source-seed
+        type: string
+      part_size:
+        description: Split part size
+        required: true
+        default: 1900M
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  WEBRTC_GCLIENT_JOBS: '8'
+  WEBRTC_SOURCE_SEED_ZSTD_LEVEL: '10'
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: m109
+            branch_head: '5414'
+          - version: m144
+            branch_head: '7559'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure shell scripts are executable
+        shell: bash
+        run: git ls-files '*.sh' | xargs chmod +x
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+
+      - name: Cache source seed
+        uses: actions/cache@v4
+        with:
+          path: |
+            source/seed/${{ matrix.version }}
+          key: source-seed-${{ matrix.version }}-${{ matrix.branch_head }}-v1
+          restore-keys: |
+            source-seed-${{ matrix.version }}-
+
+      - name: Create source seed
+        if: inputs.version == 'all' || inputs.version == matrix.version
+        shell: bash
+        run: bash script/common/create_source_seed.sh "${{ matrix.version }}" "${{ matrix.branch_head }}"
+
+      - name: Package source seed
+        if: inputs.version == 'all' || inputs.version == matrix.version
+        shell: bash
+        env:
+          WEBRTC_SOURCE_SEED_PART_SIZE: ${{ inputs.part_size }}
+        run: bash script/common/package_source_seed.sh "${{ matrix.version }}" "${{ matrix.branch_head }}"
+
+      - name: Upload source seed to Release
+        if: inputs.version == 'all' || inputs.version == matrix.version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.release_tag }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "WebRTC source seed" \
+              --notes "Cached WebRTC source seeds for CI builds."
+          fi
+          gh release upload "$tag" dist/source-seed/${{ matrix.version }}/* --clobber
